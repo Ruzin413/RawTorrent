@@ -6,6 +6,7 @@ public class BencodeParser
 {
     private readonly byte[] _data;
     private int _index;
+    public int CurrentIndex => _index;
 
     // 🔥 THIS IS CRITICAL FOR BITTORRENT
     public byte[] RawInfoBytes { get; private set; }

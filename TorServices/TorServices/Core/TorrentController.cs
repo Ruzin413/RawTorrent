@@ -1,51 +1,200 @@
-using TorServices.Parser;
-using TorServices.Network;
-using TorServices.Core;
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
 using System.Net.Sockets;
 using System.Text;
-using System.Collections.Concurrent;
+using System.Threading;
+using System.Threading.Tasks;
+using TorServices.Core;
+using TorServices.Network;
+using TorServices.Parser;
+using TorServices.DHT;
 
 namespace TorServices.Core;
 
 public class TorrentController
 {
-    public async Task StartDownload(string filePath)
+    private readonly TrackerClient _tracker = new();
+    private readonly PieceDownloader _downloader = new();
+
+    public async Task StartDownload(string torrentPath)
     {
         Console.WriteLine("🚀 STARTING TORRENT ENGINE\n");
 
-        byte[] data = File.ReadAllBytes(filePath);
+        byte[] torrentData = TorrentFileReader.Read(torrentPath);
+        var parser = new BencodeParser(torrentData);
+        var meta = parser.Parse() as Dictionary<string, object>;
 
-        var parser = new BencodeParser(data);
-        var root = parser.Parse() as Dictionary<string, object>;
+        if (meta == null)
+            return;
 
-        if (root == null)
+        var announce = meta["announce"].ToString();
+        var info = meta["info"] as Dictionary<string, object>;
+
+        byte[] infoHash = TorrentCrypto.ComputeInfoHash(parser.RawInfoBytes);
+        string peerId = "-TS0001-" + Guid.NewGuid().ToString("N")[..12];
+
+        List<string> trackers = new() { announce };
+
+        await ExecuteDownload(infoHash, peerId, info, trackers);
+    }
+
+    public async Task StartMagnetDownload(string magnetUri)
+    {
+        Console.WriteLine("🧲 STARTING MAGNET ENGINE\n");
+
+        var magnet = MagnetParser.Parse(magnetUri);
+        string peerId = "-TS0001-" + Guid.NewGuid().ToString("N")[..12];
+
+        // 1. Find some peers first to get metadata
+        Console.WriteLine("🌐 Searching DHT and Trackers for magnet peers...");
+        List<string> initialPeers = new();
+        try
         {
-            Console.WriteLine("❌ Invalid torrent");
+            var dht = new DhtClient();
+            initialPeers.AddRange(await dht.GetPeersAsync(magnet.InfoHash));
+        }
+        catch { }
+
+        // We must also ping trackers because our DHT logic is just a placeholder!
+        foreach (var url in magnet.Trackers)
+        {
+            try
+            {
+                var p = await _tracker.GetPeers(url, magnet.InfoHash, 0, peerId);
+                initialPeers.AddRange(p);
+                Console.WriteLine($"🌐 Tracker {url} found {p.Count} peers.");
+                if (initialPeers.Count > 10) break; // Don't query infinite trackers just for metadata
+            }
+            catch { }
+        }
+
+        var uniquePeers = initialPeers.Distinct().ToList();
+
+        if (uniquePeers.Count == 0)
+        {
+            Console.WriteLine("❌ Could not find peers to fetch metadata.");
             return;
         }
 
-        var meta = ExtractMetadata(root);
-        int totalPieces = meta.Pieces.Length / 20;
+        // 2. Fetch metadata from peers concurrently
+        var fetcher = new MetadataFetcher();
+        byte[] infoData = null;
 
-        byte[] infoHash = TorrentCrypto.ComputeInfoHash(parser.RawInfoBytes);
-        string peerId = "-UT3530-" + Guid.NewGuid().ToString("N")[..12];
+        var fetchTasks = new List<Task<byte[]>>();
+        using var cts = new CancellationTokenSource();
 
-        Console.WriteLine($"📦 {meta.Name}");
-        Console.WriteLine($"🔑 {BitConverter.ToString(infoHash).Replace("-", "")}");
-        Console.WriteLine($"🧩 Pieces: {totalPieces}\n");
+        // Start fetching from the first 50 peers simultaneously
+        foreach (var peer in uniquePeers.Take(50))
+        {
+            var (ip, port) = ParsePeer(peer);
+            var task = Task.Run(async () =>
+            {
+                try
+                {
+                    // Each fetcher internally times out after 30s
+                    return await fetcher.FetchMetadataAsync(ip, port, magnet.InfoHash, peerId, cts.Token);
+                }
+                catch
+                {
+                    return null;
+                }
+            }, cts.Token);
+            fetchTasks.Add(task);
+        }
 
-        var tracker = new TrackerClient();
+        Console.WriteLine($"🚀 Attempting to connect to {fetchTasks.Count} peers concurrently to fetch metadata...");
 
-        Console.WriteLine("🌐 Contacting tracker...\n");
+        // Wait for ANY task to succeed
+        while (fetchTasks.Count > 0)
+        {
+            var finishedTask = await Task.WhenAny(fetchTasks);
+            fetchTasks.Remove(finishedTask);
 
-        var peers = await tracker.GetPeers(
-            meta.Announce,
-            infoHash,
-            meta.Length,
-            peerId
-        );
+            var result = await finishedTask;
+            if (result != null)
+            {
+                infoData = result;
+                cts.Cancel(); // Force stop all other metadata download threads
+                Console.WriteLine($"✅ Metadata downloaded successfully from a peer!");
+                break;
+            }
+        }
 
-        Console.WriteLine($"👥 Peers found: {peers.Count}\n");
+        if (infoData == null)
+        {
+            Console.WriteLine("❌ Failed to fetch metadata from any peer. They might all be dead or offline.");
+            return;
+        }
+
+        var parser = new BencodeParser(infoData);
+        var info = parser.Parse() as Dictionary<string, object>;
+
+        if (info == null) return;
+
+        await ExecuteDownload(magnet.InfoHash, peerId, info, magnet.Trackers, uniquePeers);
+    }
+
+    private async Task ExecuteDownload(byte[] infoHash, string peerId, Dictionary<string, object> info, List<string> trackers, List<string>? initialDhtPeers = null)
+    {
+        string name = Encoding.UTF8.GetString((byte[])info["name"]);
+        
+        long length = 0;
+        if (info.ContainsKey("length"))
+        {
+            length = Convert.ToInt64(info["length"]);
+        }
+        else if (info.ContainsKey("files"))
+        {
+            if (info["files"] is List<object> files)
+            {
+                foreach (var f in files)
+                {
+                    if (f is Dictionary<string, object> file && file.ContainsKey("length"))
+                    {
+                        length += Convert.ToInt64(file["length"]);
+                    }
+                }
+            }
+        }
+
+        int pieceLength = Convert.ToInt32(info["piece length"]);
+        byte[] pieces = (byte[])info["pieces"];
+
+        int pieceCount = pieces.Length / 20;
+
+        Console.WriteLine($"\n📦 {name}");
+        Console.WriteLine($"🧩 Pieces: {pieceCount}");
+        Console.WriteLine($"🔑 InfoHash: {BitConverter.ToString(infoHash).Replace("-", "")}\n");
+
+        // ---------------- TRACKER ----------------
+        Console.WriteLine("🌐 Contacting trackers...\n");
+
+        List<string> allPeers = initialDhtPeers ?? new List<string>();
+
+        foreach (var t in trackers)
+        {
+            try
+            {
+                var p = await _tracker.GetPeers(t, infoHash, length, peerId);
+                allPeers.AddRange(p);
+            }
+            catch { }
+        }
+
+        if (initialDhtPeers == null)
+        {
+            try
+            {
+                var dht = new DhtClient();
+                allPeers.AddRange(await dht.GetPeersAsync(infoHash));
+            }
+            catch { }
+        }
+
+        var peers = allPeers.Distinct().ToList();
+        Console.WriteLine($"\n👥 Total unique peers: {peers.Count}");
 
         if (peers.Count == 0)
         {
@@ -53,112 +202,82 @@ public class TorrentController
             return;
         }
 
-        var pieceManager = new PieceManager();
-        var downloader = new PieceDownloader();
+        // ---------------- PIECE MANAGER ----------------
+        using var pieceManager = new PieceManager(name, pieceLength, length);
 
-        // ============================
-        // 🔥 PARALLEL SYSTEM
-        // ============================
+        // ---------------- DOWNLOAD ----------------
+        Console.WriteLine("\n📥 Starting download...\n");
 
-        int maxParallel = 10; // you can tune this
-        var semaphore = new SemaphoreSlim(maxParallel);
+        int peerIndex = 0;
+        var pieceQueue = new ConcurrentQueue<int>(Enumerable.Range(0, pieceCount));
+        
+        // Sequentially instead of in parallel for now per request
+        int maxConcurrency = 1; // Math.Min(50, pieceCount);
 
         var tasks = new List<Task>();
 
-        var pieceQueue = new ConcurrentQueue<int>(
-            Enumerable.Range(0, totalPieces)
-        );
-
-        var inProgress = new ConcurrentDictionary<int, bool>();
-
-        for (int i = 0; i < maxParallel; i++)
+        for (int i = 0; i < maxConcurrency; i++)
         {
             tasks.Add(Task.Run(async () =>
             {
-                while (pieceQueue.TryDequeue(out int index))
+                while (pieceQueue.TryDequeue(out int id))
                 {
-                    await semaphore.WaitAsync();
-
-                    try
+                    bool pieceDownloaded = false;
+                    while (!pieceDownloaded)
                     {
-                        if (pieceManager.HasPiece(index))
-                            continue;
+                        string peer = GetNextPeer(peers, ref peerIndex);
 
-                        if (!inProgress.TryAdd(index, true))
-                            continue;
-
-                        bool success = false;
-
-                        foreach (var peer in peers)
+                        try
                         {
-                            var parts = peer.Split(':');
-                            string ip = parts[0];
-                            int port = int.Parse(parts[1]);
-
-                            try
+                            if (!pieceManager.TryClaimPiece(id))
                             {
-                                Console.WriteLine($"📥 [{index}] -> {ip}:{port}");
-
-                                using TcpClient client = new TcpClient();
-                                await client.ConnectAsync(ip, port);
-
-                                using var stream = client.GetStream();
-
-                                var peerClient = new PeerClient();
-
-                                bool handshake = await peerClient.HandshakeAsync(
-                                    stream,
-                                    infoHash,
-                                    peerId
-                                );
-
-                                if (!handshake)
-                                    continue;
-
-                                int pieceLength =
-                                    (index == totalPieces - 1)
-                                        ? (int)(meta.Length - (long)index * meta.PieceLength)
-                                        : meta.PieceLength;
-
-                                byte[] piece = await downloader.DownloadPiece(
-                                    stream,
-                                    index,
-                                    pieceLength
-                                );
-
-                                byte[] expected = new byte[20];
-                                Buffer.BlockCopy(meta.Pieces, index * 20, expected, 0, 20);
-
-                                if (PieceVerifier.Verify(piece, expected))
-                                {
-                                    pieceManager.StorePiece(index, piece);
-
-                                    Console.WriteLine($"✅ [{index}] OK");
-
-                                    success = true;
-                                    break;
-                                }
-                                else
-                                {
-                                    Console.WriteLine($"❌ [{index}] corrupt");
-                                }
+                                pieceDownloaded = true;
+                                continue;
                             }
-                            catch
+
+                            Console.WriteLine($"📥 [{id}] -> {peer}");
+
+                            var (ip, port) = ParsePeer(peer);
+
+                            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+                            using var tcp = new TcpClient();
+                            await tcp.ConnectAsync(ip, port, cts.Token);
+
+                            var stream = tcp.GetStream();
+                            var peerClient = new PeerClient();
+
+                            bool ok = await peerClient.HandshakeAsync(stream, infoHash, peerId);
+
+                            if (!ok)
                             {
-                                // silent fail → try next peer
+                                throw new Exception("Handshake failed");
                             }
+
+                            var data = await _downloader.DownloadPiece(
+                                stream,
+                                id,
+                                GetPieceLength(id, pieceCount, length, pieceLength),
+                                cts.Token
+                            );
+
+                            byte[] expectedHash = new byte[20];
+                            Buffer.BlockCopy(pieces, id * 20, expectedHash, 0, 20);
+
+                            if (!PieceVerifier.Verify(data, expectedHash))
+                            {
+                                throw new Exception("SHA1 hash mismatch");
+                            }
+
+                            pieceManager.Store(id, data);
+                            Console.WriteLine($"✅ [{id}] OK");
+                            pieceDownloaded = true;
                         }
-
-                        if (!success)
+                        catch (Exception ex)
                         {
-                            Console.WriteLine($"🔁 [{index}] requeue");
-                            pieceQueue.Enqueue(index); // retry later
+                            Console.WriteLine($"⚠ [{id}] error: {ex.Message}");
+                            pieceManager.ReleasePiece(id);
+                            // Try the next peer for the same piece
                         }
-                    }
-                    finally
-                    {
-                        inProgress.TryRemove(index, out _);
-                        semaphore.Release();
                     }
                 }
             }));
@@ -166,40 +285,32 @@ public class TorrentController
 
         await Task.WhenAll(tasks);
 
-        // ============================
-        // BUILD FILE
-        // ============================
-
-        if (pieceManager.GetMissingPieces(totalPieces).Count == 0)
-        {
-            Console.WriteLine("\n💾 Building file...");
-
-            byte[] file = pieceManager.BuildFile(totalPieces);
-
-            string output = $"{meta.Name}.bin";
-            File.WriteAllBytes(output, file);
-
-            Console.WriteLine("🎉 DOWNLOAD COMPLETE");
-        }
-        else
-        {
-            Console.WriteLine("\n❌ Download incomplete");
-        }
+        Console.WriteLine("\n💾 Building file...");
+        pieceManager.BuildFile(pieceCount, name);
+        Console.WriteLine("🎉 DOWNLOAD COMPLETE");
     }
 
-    // ---------------- METADATA ----------------
+    // ---------------- HELPERS ----------------
 
-    private TorrentMetadata ExtractMetadata(Dictionary<string, object> root)
+    private string GetNextPeer(List<string> peers, ref int index)
     {
-        var info = (Dictionary<string, object>)root["info"];
+        int current = Interlocked.Increment(ref index);
+        return peers[Math.Abs(current) % peers.Count];
+    }
 
-        return new TorrentMetadata
-        {
-            Announce = Encoding.UTF8.GetString((byte[])root["announce"]),
-            Name = Encoding.UTF8.GetString((byte[])info["name"]),
-            Length = (long)info["length"],
-            PieceLength = Convert.ToInt32(info["piece length"]),
-            Pieces = (byte[])info["pieces"]
-        };
+    private (string ip, int port) ParsePeer(string peer)
+    {
+        var parts = peer.Split(':');
+        return (parts[0], int.Parse(parts[1]));
+    }
+
+    private int GetPieceLength(int index, int totalPieces, long fileSize, int pieceLength)
+    {
+        long last = fileSize % pieceLength;
+
+        if (index == totalPieces - 1 && last != 0)
+            return (int)last;
+
+        return pieceLength;
     }
 }

@@ -14,6 +14,9 @@ public class PeerClient
             handshake[0] = 19;
             Encoding.ASCII.GetBytes("BitTorrent protocol").CopyTo(handshake, 1);
 
+            // BEP 10 Extension Protocol Enable
+            handshake[25] |= 0x10;
+
             Buffer.BlockCopy(infoHash, 0, handshake, 28, 20);
 
             Encoding.ASCII.GetBytes(peerId).CopyTo(handshake, 48);

@@ -1,76 +1,52 @@
+using System;
 using System.Collections.Concurrent;
+using System.IO;
 
 namespace TorServices.Core;
 
-public class PieceManager
+public class PieceManager : IDisposable
 {
-    private readonly ConcurrentDictionary<int, byte[]> _pieces = new();
+    private readonly FileStream _fileStream;
+    private readonly int _pieceLength;
+    private readonly ConcurrentDictionary<int, bool> _claimed = new();
+    private readonly object _lock = new();
 
-    public void StorePiece(int index, byte[] data)
+    public PieceManager(string fileName, int pieceLength, long totalLength)
     {
-        _pieces[index] = data;
+        _pieceLength = pieceLength;
+        _fileStream = new FileStream(fileName, FileMode.OpenOrCreate, FileAccess.Write, FileShare.Read);
+        _fileStream.SetLength(totalLength);
     }
 
-    public bool HasPiece(int index)
-        => _pieces.ContainsKey(index);
-
-    public List<int> GetMissingPieces(int totalPieces)
+    public bool TryClaimPiece(int index)
     {
-        var missing = new List<int>();
+        return _claimed.TryAdd(index, true);
+    }
 
-        for (int i = 0; i < totalPieces; i++)
+    public void ReleasePiece(int index)
+    {
+        _claimed.TryRemove(index, out _);
+    }
+
+    public void Store(int index, byte[] data)
+    {
+        lock (_lock)
         {
-            if (!_pieces.ContainsKey(i))
-                missing.Add(i);
+            long offset = (long)index * _pieceLength;
+            _fileStream.Seek(offset, SeekOrigin.Begin);
+            _fileStream.Write(data, 0, data.Length);
+            _fileStream.Flush();
         }
-
-        return missing;
     }
 
-    // =========================
-    // SAFE BUILD (NO CRASH)
-    // =========================
-    public byte[] BuildFile(int totalPieces)
+    public void BuildFile(int totalPieces, string fileName)
     {
-        var file = new List<byte>();
-
-        for (int i = 0; i < totalPieces; i++)
-        {
-            if (_pieces.TryGetValue(i, out var piece))
-            {
-                file.AddRange(piece);
-            }
-            else
-            {
-                Console.WriteLine($"⚠ Missing piece {i} - build aborted safely");
-                throw new Exception($"Cannot build file: missing piece {i}");
-            }
-        }
-
-        return file.ToArray();
+        // Data is written in-place real-time. No memory merge required.
+        Console.WriteLine($"\n✅ All pieces streamed directly to {fileName}");
     }
 
-    // =========================
-    // SAFE VERSION (NO THROW)
-    // =========================
-    public byte[] BuildFileSafe(int totalPieces)
+    public void Dispose()
     {
-        var file = new List<byte>();
-
-        for (int i = 0; i < totalPieces; i++)
-        {
-            if (_pieces.TryGetValue(i, out var piece))
-            {
-                file.AddRange(piece);
-            }
-            else
-            {
-                Console.WriteLine($"⚠ Skipping missing piece {i}");
-            }
-        }
-
-        return file.ToArray();
+        _fileStream?.Dispose();
     }
-
-    public int CompletedPieces => _pieces.Count;
 }

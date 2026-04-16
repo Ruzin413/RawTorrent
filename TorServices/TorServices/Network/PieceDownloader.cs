@@ -1,5 +1,4 @@
 using System.Net.Sockets;
-using TorServices.Network;
 
 namespace TorServices.Network;
 
@@ -7,93 +6,92 @@ public class PieceDownloader
 {
     private const int BlockSize = 16384;
 
-    // ================================
-    // WAIT FOR UNCHOKE
-    // ================================
-    public async Task WaitForUnchokeAsync(NetworkStream stream)
+    public async Task WaitForUnchokeAsync(NetworkStream stream, CancellationToken token)
     {
         while (true)
         {
-            var (id, _) = await ReadMessageAsync(stream);
-
+            token.ThrowIfCancellationRequested();
+            var (id, _) = await ReadMessageAsync(stream, token);
             if (id == PeerMessage.Unchoke)
                 return;
         }
     }
 
-    // ================================
-    // DOWNLOAD FULL PIECE (FIXED)
-    // ================================
-    public async Task<byte[]> DownloadPiece(
-        NetworkStream stream,
-        int index,
-        int pieceLength)
+    public async Task<byte[]> DownloadPiece(NetworkStream stream, int index, int length, CancellationToken token)
     {
-        List<byte> piece = new();
-        int downloaded = 0;
+        byte[] data = new byte[length];
+        int receivedBytes = 0;
+        int requestedOffset = 0;
+        int pendingRequests = 0;
+        const int MaxPending = 8; // Standard BitTorrent pipeline size
 
-        // IMPORTANT: keep requesting blocks until full piece is built
-        while (downloaded < pieceLength)
+        byte[] interestedMsg = { 0, 0, 0, 1, 2 };
+        await stream.WriteAsync(interestedMsg, 0, 5, token);
+
+        await WaitForUnchokeAsync(stream, token);
+
+        while (receivedBytes < length)
         {
-            int requestLength = Math.Min(BlockSize, pieceLength - downloaded);
+            token.ThrowIfCancellationRequested();
 
-            // send request
-            byte[] request = BuildRequest(index, downloaded, requestLength);
-            await stream.WriteAsync(request, 0, request.Length);
+            // 1. Refill the pipeline with multiple "Request" messages
+            while (pendingRequests < MaxPending && requestedOffset < length)
+            {
+                int blockLen = Math.Min(BlockSize, length - requestedOffset);
+                byte[] request = BuildRequest(index, requestedOffset, blockLen);
+                await stream.WriteAsync(request, 0, request.Length, token);
+                
+                requestedOffset += blockLen;
+                pendingRequests++;
+            }
 
-            // read response
-            var (id, payload) = await ReadMessageAsync(stream);
+            // 2. Wait for and process the next message from the peer
+            var (id, payload) = await ReadMessageAsync(stream, token);
+
+            if (id == PeerMessage.Choke)
+            {
+                await WaitForUnchokeAsync(stream, token);
+                // Reset the requested offset to total received to re-pull the "tail" of the piece
+                requestedOffset = receivedBytes;
+                pendingRequests = 0;
+                continue;
+            }
 
             if (id == PeerMessage.Piece)
             {
-                // payload:
-                // index (4 bytes) + begin (4 bytes) + block
-
-                if (payload.Length < 8)
+                if (payload.Length <= 8)
                     continue;
 
-                int begin =
-                    (payload[0] << 24) |
-                    (payload[1] << 16) |
-                    (payload[2] << 8) |
-                    payload[3];
+                int pIndex = (payload[0] << 24) | (payload[1] << 16) | (payload[2] << 8) | payload[3];
+                int pBegin = (payload[4] << 24) | (payload[5] << 16) | (payload[6] << 8) | payload[7];
 
-                int blockSize = payload.Length - 8;
+                if (pIndex != index)
+                    continue;
 
-                byte[] block = new byte[blockSize];
-                Buffer.BlockCopy(payload, 8, block, 0, blockSize);
+                int dataLen = payload.Length - 8;
+                if (dataLen <= 0 || pBegin + dataLen > length)
+                    continue;
 
-                piece.AddRange(block);
-                downloaded += blockSize;
-            }
-            else if (id == PeerMessage.Choke)
-            {
-                await WaitForUnchokeAsync(stream);
-            }
-            else if (id == 99)
-            {
-                throw new Exception("Connection lost");
+                // Store the block and update our counters
+                Buffer.BlockCopy(payload, 8, data, pBegin, dataLen);
+                receivedBytes += dataLen;
+                pendingRequests--;
             }
         }
 
-        return piece.ToArray();
+        return data;
     }
 
-    // ================================
-    // READ MESSAGE (SAFE)
-    // ================================
-    private async Task<(byte id, byte[] payload)> ReadMessageAsync(NetworkStream stream)
+    private async Task<(byte id, byte[] payload)> ReadMessageAsync(NetworkStream stream, CancellationToken token)
     {
         byte[] lenBuf = new byte[4];
-        int readTotal = 0;
 
-        while (readTotal < 4)
+        int headerOffset = 0;
+        while (headerOffset < 4)
         {
-            int read = await stream.ReadAsync(lenBuf, readTotal, 4 - readTotal);
-            if (read == 0)
-                return (99, Array.Empty<byte>());
-
-            readTotal += read;
+            int r = await stream.ReadAsync(lenBuf, headerOffset, 4 - headerOffset, token);
+            if (r == 0) return (99, Array.Empty<byte>());
+            headerOffset += r;
         }
 
         int length =
@@ -106,39 +104,29 @@ public class PieceDownloader
             return (99, Array.Empty<byte>()); // keep-alive
 
         byte[] body = new byte[length];
-        int bodyRead = 0;
+        int offset = 0;
 
-        while (bodyRead < length)
+        while (offset < length)
         {
-            int read = await stream.ReadAsync(body, bodyRead, length - bodyRead);
-            if (read == 0)
-                throw new Exception("Connection closed");
-
-            bodyRead += read;
+            int r = await stream.ReadAsync(body, offset, length - offset, token);
+            if (r == 0) throw new Exception("Disconnected");
+            offset += r;
         }
 
         byte id = body[0];
-
         byte[] payload = new byte[length - 1];
+
         if (length > 1)
             Buffer.BlockCopy(body, 1, payload, 0, length - 1);
 
         return (id, payload);
     }
 
-    // ================================
-    // BUILD REQUEST MESSAGE
-    // ================================
     private byte[] BuildRequest(int index, int begin, int length)
     {
         byte[] msg = new byte[17];
 
-        // length = 13 bytes after this field
-        msg[0] = 0;
-        msg[1] = 0;
-        msg[2] = 0;
         msg[3] = 13;
-
         msg[4] = PeerMessage.Request;
 
         WriteInt(msg, 5, index);
@@ -148,9 +136,6 @@ public class PieceDownloader
         return msg;
     }
 
-    // ================================
-    // BIG ENDIAN INT WRITER
-    // ================================
     private void WriteInt(byte[] buffer, int offset, int value)
     {
         buffer[offset] = (byte)(value >> 24);
