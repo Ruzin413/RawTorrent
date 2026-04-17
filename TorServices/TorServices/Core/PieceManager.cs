@@ -18,7 +18,7 @@ public class PieceManager : IDisposable
     public PieceManager(TorrentMetadata metadata, string outputDir)
     {
         _metadata = metadata;
-        _outputDir = string.IsNullOrWhiteSpace(outputDir) ? Directory.GetCurrentDirectory() : outputDir;
+        _outputDir = string.IsNullOrWhiteSpace(outputDir) ? @"C:\Users\Dell\Desktop\TorrentDownload" : outputDir;
         
         EnsureDirectoriesAndFiles();
         OpenHandles();
