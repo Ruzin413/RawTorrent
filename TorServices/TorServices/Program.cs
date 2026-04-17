@@ -14,7 +14,7 @@ class Program
             Console.Clear();
             Console.ForegroundColor = ConsoleColor.Cyan;
             Console.WriteLine("=========================================================");
-            Console.WriteLine("     Hello! This is RawTorrent Engine ");
+            Console.WriteLine("     Hello! This is RawTorrent Engine By Rujin Manandhar");
             Console.WriteLine("=========================================================\n");
             Console.ResetColor();
             
