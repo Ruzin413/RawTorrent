@@ -14,6 +14,6 @@ public class FileBuilder
     public void Save(string path)
     {
         File.WriteAllBytes(path, _file.ToArray());
-        Console.WriteLine($"💾 File saved: {path}");
+        Console.WriteLine($"[+] File saved: {path}");
     }
 }

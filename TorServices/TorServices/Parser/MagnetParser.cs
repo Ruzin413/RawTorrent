@@ -4,8 +4,8 @@ namespace TorServices.Parser;
 
 public class MagnetData
 {
-    public byte[] InfoHash { get; set; }
-    public string DisplayName { get; set; }
+    public byte[] InfoHash { get; set; } = Array.Empty<byte>();
+    public string? DisplayName { get; set; }
     public List<string> Trackers { get; set; } = new();
 }
 
@@ -17,12 +17,12 @@ public static class MagnetParser
 
         var query = HttpUtility.ParseQueryString(uri.Query);
 
-        string xt = query["xt"];
-        string dn = query["dn"];
-        string[] tr = query.GetValues("tr") ?? new string[0];
+        string? xt = query["xt"];
+        string? dn = query["dn"];
+        string[] tr = query.GetValues("tr") ?? Array.Empty<string>();
 
         // xt = urn:btih:HASH
-        string hashHex = xt.Replace("urn:btih:", "");
+        string hashHex = xt?.Replace("urn:btih:", "") ?? "";
 
         return new MagnetData
         {

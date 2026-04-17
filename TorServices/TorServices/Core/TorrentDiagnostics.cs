@@ -9,34 +9,34 @@ public static class TorrentDiagnostics
         bool handshakeSuccess)
     {
         Console.WriteLine("\n==============================");
-        Console.WriteLine("🧪 TORRENT SYSTEM STATUS CHECK");
+        Console.WriteLine("*** TORRENT SYSTEM STATUS CHECK ***");
         Console.WriteLine("==============================");
 
-        Console.WriteLine($"\n🌐 Tracker:");
+        Console.WriteLine($"\n[i] Tracker:");
         Console.WriteLine(!string.IsNullOrEmpty(announce)
-            ? "✔ OK"
-            : "❌ FAIL");
+            ? "[OK]"
+            : "[FAIL]");
 
-        Console.WriteLine($"\n🔑 InfoHash:");
+        Console.WriteLine($"\n[i] InfoHash:");
         Console.WriteLine(infoHash != null && infoHash.Length == 20
-            ? "✔ VALID (20 bytes)"
-            : "❌ INVALID");
+            ? "[OK] VALID (20 bytes)"
+            : "[FAIL] INVALID");
 
-        Console.WriteLine($"\n👥 Peers:");
+        Console.WriteLine($"\n[i] Peers:");
         Console.WriteLine(peers != null && peers.Count > 0
-            ? $"✔ FOUND ({peers.Count})"
-            : "❌ NO PEERS");
+            ? $"[OK] FOUND ({peers.Count})"
+            : "[FAIL] NO PEERS");
 
-        Console.WriteLine($"\n🤝 Handshake:");
+        Console.WriteLine($"\n[i] Handshake:");
         Console.WriteLine(handshakeSuccess
-            ? "✔ CONNECTED"
-            : "❌ FAILED");
+            ? "[OK] CONNECTED"
+            : "[FAIL] FAILED");
 
         Console.WriteLine("\n==============================");
 
-        if (handshakeSuccess && peers.Count > 0)
-            Console.WriteLine("🚀 SYSTEM STATUS: READY FOR DOWNLOAD");
+        if (handshakeSuccess && peers != null && peers.Count > 0)
+            Console.WriteLine("[***] SYSTEM STATUS: READY FOR DOWNLOAD");
         else
-            Console.WriteLine("⚠ SYSTEM STATUS: NOT READY");
+            Console.WriteLine("[!] SYSTEM STATUS: NOT READY");
     }
 }

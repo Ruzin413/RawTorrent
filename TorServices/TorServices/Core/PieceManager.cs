@@ -51,7 +51,7 @@ public class PieceManager : IDisposable
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"\n❌ File initialization error: {ex.Message}");
+            Console.WriteLine($"\n[X] File initialization error: {ex.Message}");
             throw;
         }
     }
@@ -69,7 +69,7 @@ public class PieceManager : IDisposable
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"\n❌ Failed to open file handles: {ex.Message}");
+            Console.WriteLine($"\n[X] Failed to open file handles: {ex.Message}");
             throw;
         }
     }
@@ -130,7 +130,7 @@ public class PieceManager : IDisposable
 
     public void BuildFile(int totalPieces, string fileName)
     {
-        Console.WriteLine($"\n✅ Download progress: {_completed.Count}/{totalPieces} pieces.");
+        Console.WriteLine($"\n[*] Download progress: {_completed.Count}/{totalPieces} pieces.");
     }
 
     public void Dispose()

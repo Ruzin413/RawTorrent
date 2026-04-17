@@ -69,7 +69,7 @@ class Program
         catch (Exception ex)
         {
             Console.ForegroundColor = ConsoleColor.Red;
-            Console.WriteLine($"\n❌ CRITICAL ERROR: {ex.Message}");
+            Console.WriteLine($"\n[X] CRITICAL ERROR: {ex.Message}");
             if (ex.InnerException != null) Console.WriteLine($"   Inner: {ex.InnerException.Message}");
             Console.WriteLine(ex.StackTrace);
             Console.ResetColor();

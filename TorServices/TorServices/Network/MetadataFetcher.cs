@@ -15,7 +15,7 @@ public class MetadataFetcher
 {
     private const int MetadataPieceSize = 16384;
 
-    public async Task<byte[]> FetchMetadataAsync(string ip, int port, byte[] expectedInfoHash, string peerId, CancellationToken cancellationToken = default)
+    public async Task<byte[]?> FetchMetadataAsync(string ip, int port, byte[] expectedInfoHash, string peerId, CancellationToken cancellationToken = default)
     {
         using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(45));
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, cancellationToken);

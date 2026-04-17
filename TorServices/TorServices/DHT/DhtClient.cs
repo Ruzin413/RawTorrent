@@ -9,7 +9,7 @@ namespace TorServices.DHT;
 
 public class DhtClient : IDisposable
 {
-    private readonly UdpClient _udp;
+    private readonly UdpClient _udp = null!;
     private readonly DhtNodeId _localId;
     private readonly RoutingTable _routingTable;
     private readonly ConcurrentDictionary<string, TaskCompletionSource<Dictionary<string, object>>> _pendingQueries = new();
@@ -35,12 +35,12 @@ public class DhtClient : IDisposable
                 bound = true;
                 break; 
             }
-            catch (SocketException ex)
+            catch (SocketException)
             {
                 retryCount++;
                 if (retryCount >= 10) 
                 {
-                    Console.WriteLine($"\n⚠️ Warning: Could not bind to any DHT port in range {port}-{port+9}. DHT discovery will be disabled.");
+                    Console.WriteLine($"\n[!] Warning: Could not bind to any DHT port in range {port}-{port+9}. DHT discovery will be disabled.");
                 }
             }
         }
@@ -113,7 +113,7 @@ public class DhtClient : IDisposable
         // Add node to routing table if possible
         if (msg.ContainsKey("r") && msg["r"] is Dictionary<string, object> r && r.ContainsKey("id"))
         {
-            byte[] idBytes = r["id"] as byte[];
+            byte[]? idBytes = r["id"] as byte[];
             if (idBytes != null && idBytes.Length == 20)
             {
                 _routingTable.AddNode(new DhtNode(remote.Address.ToString(), remote.Port, new DhtNodeId(idBytes)));
@@ -222,7 +222,7 @@ public class DhtClient : IDisposable
 
         if (r.ContainsKey("nodes"))
         {
-            byte[] nodes = r["nodes"] as byte[];
+            byte[]? nodes = r["nodes"] as byte[];
             if (nodes != null) ParseNodes(nodes);
         }
 

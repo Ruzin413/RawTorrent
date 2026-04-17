@@ -8,11 +8,10 @@ public class BencodeParser
     private int _index;
     public int CurrentIndex => _index;
 
-    // 🔥 THIS IS CRITICAL FOR BITTORRENT
-    public byte[] RawInfoBytes { get; private set; }
+    // THIS IS CRITICAL FOR BITTORRENT
+    public byte[] RawInfoBytes { get; private set; } = Array.Empty<byte>();
 
     private int _infoStartIndex;
-    private bool _capturingInfo;
 
     public BencodeParser(byte[] data)
     {
@@ -111,18 +110,17 @@ public class BencodeParser
             byte[] keyBytes = ParseString();
             string key = Encoding.ASCII.GetString(keyBytes);
 
-            // 🔥 CRITICAL FIX: detect "info" dictionary start
+            // CRITICAL FIX: detect "info" dictionary start
             if (key == "info")
             {
                 _infoStartIndex = _index;
-                _capturingInfo = true;
             }
 
             object value = ParseNext();
 
             dict[key] = value;
 
-            // 🔥 CRITICAL FIX: capture exact bencoded "info"
+            // CRITICAL FIX: capture exact bencoded "info"
             if (key == "info")
             {
                 int endIndex = _index;
@@ -135,8 +133,6 @@ public class BencodeParser
                     0,
                     RawInfoBytes.Length
                 );
-
-                _capturingInfo = false;
             }
         }
 
