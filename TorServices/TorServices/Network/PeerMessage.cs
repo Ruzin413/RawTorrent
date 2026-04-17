@@ -10,4 +10,5 @@ public static class PeerMessage
     public const byte Bitfield = 5;
     public const byte Request = 6;
     public const byte Piece = 7;
+    public const byte Extended = 20;
 }

@@ -1,4 +1,6 @@
 using System.Net.Sockets;
+using System.Text;
+using TorServices.Parser;
 
 namespace TorServices.Network;
 
@@ -11,9 +13,13 @@ public class PieceDownloader
         while (true)
         {
             token.ThrowIfCancellationRequested();
-            var (id, _) = await ReadMessageAsync(stream, token);
+            var (id, payload) = await PeerClient.ReadMessageAsync(stream, token);
+            
             if (id == PeerMessage.Unchoke)
                 return;
+                
+            // Handle or skip messages that might arrive before unchoke
+            // (Bitfield, Have, Extended, etc. are common right after handshake)
         }
     }
 
@@ -25,7 +31,21 @@ public class PieceDownloader
         int pendingRequests = 0;
         const int MaxPending = 8; // Standard BitTorrent pipeline size
 
-        byte[] interestedMsg = { 0, 0, 0, 1, 2 };
+        // 1. Send Extended Handshake (BEP 10)
+        var hsDict = new Dictionary<string, object>
+        {
+            { "m", new Dictionary<string, object> { { "ut_metadata", 1 }, { "ut_pex", 1 } } }
+        };
+        byte[] extPayload = BencodeEncoder.EncodeDictionary(hsDict);
+        byte[] extMsg = new byte[6 + extPayload.Length];
+        PeerClient.WriteInt(extMsg, 0, 2 + extPayload.Length);
+        extMsg[4] = PeerMessage.Extended;
+        extMsg[5] = 0; // Subtype 0: Handshake
+        Buffer.BlockCopy(extPayload, 0, extMsg, 6, extPayload.Length);
+        await stream.WriteAsync(extMsg, 0, extMsg.Length, token);
+
+        // 2. Standard Interested signal
+        byte[] interestedMsg = { 0, 0, 0, 1, PeerMessage.Interested };
         await stream.WriteAsync(interestedMsg, 0, 5, token);
 
         await WaitForUnchokeAsync(stream, token);
@@ -34,7 +54,7 @@ public class PieceDownloader
         {
             token.ThrowIfCancellationRequested();
 
-            // 1. Refill the pipeline with multiple "Request" messages
+            // 3. Keep pipeline full
             while (pendingRequests < MaxPending && requestedOffset < length)
             {
                 int blockLen = Math.Min(BlockSize, length - requestedOffset);
@@ -45,13 +65,12 @@ public class PieceDownloader
                 pendingRequests++;
             }
 
-            // 2. Wait for and process the next message from the peer
-            var (id, payload) = await ReadMessageAsync(stream, token);
+            // 4. Read response
+            var (id, payload) = await PeerClient.ReadMessageAsync(stream, token);
 
             if (id == PeerMessage.Choke)
             {
                 await WaitForUnchokeAsync(stream, token);
-                // Reset the requested offset to total received to re-pull the "tail" of the piece
                 requestedOffset = receivedBytes;
                 pendingRequests = 0;
                 continue;
@@ -59,88 +78,38 @@ public class PieceDownloader
 
             if (id == PeerMessage.Piece)
             {
-                if (payload.Length <= 8)
-                    continue;
+                if (payload.Length <= 8) continue;
 
                 int pIndex = (payload[0] << 24) | (payload[1] << 16) | (payload[2] << 8) | payload[3];
                 int pBegin = (payload[4] << 24) | (payload[5] << 16) | (payload[6] << 8) | payload[7];
 
-                if (pIndex != index)
-                    continue;
+                if (pIndex != index) continue;
 
                 int dataLen = payload.Length - 8;
-                if (dataLen <= 0 || pBegin + dataLen > length)
-                    continue;
+                if (dataLen <= 0 || pBegin + dataLen > length) continue;
 
-                // Store the block and update our counters
                 Buffer.BlockCopy(payload, 8, data, pBegin, dataLen);
                 receivedBytes += dataLen;
                 pendingRequests--;
+
+                if (receivedBytes % (BlockSize * 4) == 0 || receivedBytes >= length)
+                    Console.Write(".");
             }
         }
-
+        Console.WriteLine();
         return data;
-    }
-
-    private async Task<(byte id, byte[] payload)> ReadMessageAsync(NetworkStream stream, CancellationToken token)
-    {
-        byte[] lenBuf = new byte[4];
-
-        int headerOffset = 0;
-        while (headerOffset < 4)
-        {
-            int r = await stream.ReadAsync(lenBuf, headerOffset, 4 - headerOffset, token);
-            if (r == 0) return (99, Array.Empty<byte>());
-            headerOffset += r;
-        }
-
-        int length =
-            (lenBuf[0] << 24) |
-            (lenBuf[1] << 16) |
-            (lenBuf[2] << 8) |
-            lenBuf[3];
-
-        if (length == 0)
-            return (99, Array.Empty<byte>()); // keep-alive
-
-        byte[] body = new byte[length];
-        int offset = 0;
-
-        while (offset < length)
-        {
-            int r = await stream.ReadAsync(body, offset, length - offset, token);
-            if (r == 0) throw new Exception("Disconnected");
-            offset += r;
-        }
-
-        byte id = body[0];
-        byte[] payload = new byte[length - 1];
-
-        if (length > 1)
-            Buffer.BlockCopy(body, 1, payload, 0, length - 1);
-
-        return (id, payload);
     }
 
     private byte[] BuildRequest(int index, int begin, int length)
     {
         byte[] msg = new byte[17];
-
         msg[3] = 13;
         msg[4] = PeerMessage.Request;
 
-        WriteInt(msg, 5, index);
-        WriteInt(msg, 9, begin);
-        WriteInt(msg, 13, length);
+        PeerClient.WriteInt(msg, 5, index);
+        PeerClient.WriteInt(msg, 9, begin);
+        PeerClient.WriteInt(msg, 13, length);
 
         return msg;
-    }
-
-    private void WriteInt(byte[] buffer, int offset, int value)
-    {
-        buffer[offset] = (byte)(value >> 24);
-        buffer[offset + 1] = (byte)(value >> 16);
-        buffer[offset + 2] = (byte)(value >> 8);
-        buffer[offset + 3] = (byte)value;
     }
 }

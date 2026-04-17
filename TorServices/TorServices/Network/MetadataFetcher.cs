@@ -1,166 +1,115 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Net.Sockets;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using TorServices.Parser;
+using TorServices.Core;
 
 namespace TorServices.Network;
 
 public class MetadataFetcher
 {
-    // Fetches metadata using BEP 09
-    public async Task<byte[]> FetchMetadataAsync(string ip, int port, byte[] infoHash, string peerId, CancellationToken cancellationToken = default)
+    private const int MetadataPieceSize = 16384;
+
+    public async Task<byte[]> FetchMetadataAsync(string ip, int port, byte[] expectedInfoHash, string peerId, CancellationToken cancellationToken = default)
     {
-        using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(45));
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, cancellationToken);
         using var tcp = new TcpClient();
-        await tcp.ConnectAsync(ip, port, cts.Token);
+        
+        try {
+            await tcp.ConnectAsync(ip, port, cts.Token);
+        } catch { return null; }
 
         var stream = tcp.GetStream();
         var peerClient = new PeerClient();
 
-        bool hsOk = await peerClient.HandshakeAsync(stream, infoHash, peerId);
-        if (!hsOk) throw new Exception("Handshake failed");
+        var (hsOk, hsExtensions) = await peerClient.HandshakeAsync(stream, expectedInfoHash, peerId);
+        if (!hsOk || !hsExtensions) return null;
 
-        // Send Extended Handshake (ID=20, Subtype=0)
+        // 1. Send Extended Handshake
         int myMetadataId = 1;
-        var hsDict = new Dictionary<string, object>
-        {
+        var hsDict = new Dictionary<string, object> {
             { "m", new Dictionary<string, object> { { "ut_metadata", myMetadataId } } }
         };
-        
-        byte[] payload = BencodeEncoder.EncodeDictionary(hsDict);
-        byte[] extMsg = new byte[6 + payload.Length];
-        
-        WriteInt(extMsg, 0, 2 + payload.Length);
-        extMsg[4] = 20; // Extended message
-        extMsg[5] = 0;  // Subtype 0: Handshake
-        Buffer.BlockCopy(payload, 0, extMsg, 6, payload.Length);
-
-        await stream.WriteAsync(extMsg, 0, extMsg.Length, cts.Token);
+        await SendExtendedMessageAsync(stream, 0, BencodeEncoder.EncodeDictionary(hsDict), cts.Token);
 
         int metadataSize = -1;
         int utMetadataId = -1;
 
-        // Wait for peer extended handshake
-        while (true)
+        // 2. Wait for peer extended handshake
+        while (metadataSize == -1)
         {
-            var (id, block) = await ReadMessageAsync(stream, cts.Token);
-
-            if (id == 20 && block.Length > 0 && block[0] == 0) // Extended Handshake
+            var (id, block) = await PeerClient.ReadMessageAsync(stream, cts.Token);
+            if (id == PeerMessage.Extended && block.Length > 0 && block[0] == 0)
             {
-                byte[] dictBytes = new byte[block.Length - 1];
-                Buffer.BlockCopy(block, 1, dictBytes, 0, dictBytes.Length);
-
-                var parser = new BencodeParser(dictBytes);
-                var dict = parser.Parse() as Dictionary<string, object>;
-                
+                var dict = new BencodeParser(block.Skip(1).ToArray()).Parse() as Dictionary<string, object>;
                 if (dict != null)
                 {
-                    if (dict.ContainsKey("metadata_size"))
-                        metadataSize = Convert.ToInt32(dict["metadata_size"]);
-                    
-                    if (dict.ContainsKey("m"))
-                    {
-                        var m = dict["m"] as Dictionary<string, object>;
-                        if (m != null && m.ContainsKey("ut_metadata"))
-                            utMetadataId = Convert.ToInt32(m["ut_metadata"]);
-                    }
+                    if (dict.ContainsKey("metadata_size")) metadataSize = Convert.ToInt32(dict["metadata_size"]);
+                    if (dict.ContainsKey("m") && dict["m"] is Dictionary<string, object> m && m.ContainsKey("ut_metadata"))
+                        utMetadataId = Convert.ToInt32(m["ut_metadata"]);
                 }
-                
-                break;
             }
         }
 
-        if (metadataSize <= 0 || utMetadataId <= 0)
-            throw new Exception("Peer doesn't support ut_metadata");
+        if (metadataSize <= 0 || utMetadataId <= 0) return null;
 
-        Console.WriteLine($"\n📦 Peer advertised metadata: {metadataSize} bytes. Downloading...");
+        // 3. Download all pieces
+        int totalPieces = (int)Math.Ceiling(metadataSize / (double)MetadataPieceSize);
+        byte[] fullMetadata = new byte[metadataSize];
+        int piecesDownloaded = 0;
 
-        // Request piece 0
-        var reqDict = new Dictionary<string, object>
+        for (int i = 0; i < totalPieces; i++)
         {
-            { "msg_type", 0 },
-            { "piece", 0 }
-        };
+            var reqDict = new Dictionary<string, object> { { "msg_type", 0 }, { "piece", i } };
+            await SendExtendedMessageAsync(stream, utMetadataId, BencodeEncoder.EncodeDictionary(reqDict), cts.Token);
 
-        byte[] reqPayload = BencodeEncoder.EncodeDictionary(reqDict);
-        byte[] reqMsg = new byte[6 + reqPayload.Length];
-        WriteInt(reqMsg, 0, 2 + reqPayload.Length);
-        reqMsg[4] = 20;
-        reqMsg[5] = (byte)utMetadataId;
-        Buffer.BlockCopy(reqPayload, 0, reqMsg, 6, reqPayload.Length);
-
-        await stream.WriteAsync(reqMsg, 0, reqMsg.Length, cts.Token);
-
-        // Receive piece 0
-        while (true)
-        {
-            var (id, block) = await ReadMessageAsync(stream, cts.Token);
-
-            if (id == 20 && block.Length > 0 && block[0] == myMetadataId)
+            bool pieceReceived = false;
+            while (!pieceReceived)
             {
-                // Decode dict
-                byte[] dictBytes = new byte[block.Length - 1];
-                Buffer.BlockCopy(block, 1, dictBytes, 0, dictBytes.Length);
-
-                var parser = new BencodeParser(dictBytes);
-                var dict = parser.Parse() as Dictionary<string, object>;
-                
-                if (dict != null && dict.ContainsKey("msg_type") && Convert.ToInt32(dict["msg_type"]) == 1)
+                var (id, block) = await PeerClient.ReadMessageAsync(stream, cts.Token);
+                if (id == PeerMessage.Extended && block.Length > 0 && block[0] == myMetadataId)
                 {
-                    int bencodeEnd = parser.CurrentIndex;
-                    int rawSize = block.Length - 1 - bencodeEnd;
-
-                    if (rawSize == metadataSize)
+                    var parser = new BencodeParser(block.Skip(1).ToArray());
+                    var dict = parser.Parse() as Dictionary<string, object>;
+                    if (dict != null && dict.ContainsKey("msg_type") && Convert.ToInt32(dict["msg_type"]) == 1)
                     {
-                        byte[] meta = new byte[rawSize];
-                        Buffer.BlockCopy(block, 1 + bencodeEnd, meta, 0, rawSize);
-                        return meta;
+                        int pieceIdx = Convert.ToInt32(dict["piece"]);
+                        if (pieceIdx == i)
+                        {
+                            int bencodeEnd = parser.CurrentIndex;
+                            int dataLen = block.Length - 1 - bencodeEnd;
+                            Buffer.BlockCopy(block, 1 + bencodeEnd, fullMetadata, i * MetadataPieceSize, dataLen);
+                            pieceReceived = true;
+                            piecesDownloaded++;
+                        }
                     }
                 }
             }
         }
+
+        // 4. Verify SHA1 of metadata against expected info-hash
+        using var sha1 = SHA1.Create();
+        byte[] actualHash = sha1.ComputeHash(fullMetadata);
+        
+        for (int i = 0; i < 20; i++)
+            if (actualHash[i] != expectedInfoHash[i]) return null; // Hash mismatch
+
+        return fullMetadata;
     }
 
-    // DetectBencodeEnd was removed as we use parser.CurrentIndex now.
-
-    private async Task<(byte id, byte[] payload)> ReadMessageAsync(NetworkStream stream, CancellationToken token)
+    private async Task SendExtendedMessageAsync(NetworkStream stream, int extId, byte[] payload, CancellationToken token)
     {
-        byte[] lenBuf = new byte[4];
-        int headerOffset = 0;
-        while (headerOffset < 4)
-        {
-            int r = await stream.ReadAsync(lenBuf, headerOffset, 4 - headerOffset, token);
-            if (r == 0) return (99, Array.Empty<byte>());
-            headerOffset += r;
-        }
-
-        int length = (lenBuf[0] << 24) | (lenBuf[1] << 16) | (lenBuf[2] << 8) | lenBuf[3];
-        if (length == 0) return (99, Array.Empty<byte>());
-
-        byte[] body = new byte[length];
-        int offset = 0;
-        while (offset < length)
-        {
-            int r = await stream.ReadAsync(body, offset, length - offset, token);
-            if (r == 0) throw new Exception("Disconnected");
-            offset += r;
-        }
-
-        byte id = body[0];
-        byte[] payload = new byte[length - 1];
-        if (length > 1) Buffer.BlockCopy(body, 1, payload, 0, length - 1);
-        return (id, payload);
-    }
-
-    private void WriteInt(byte[] buffer, int offset, int value)
-    {
-        buffer[offset] = (byte)(value >> 24);
-        buffer[offset + 1] = (byte)(value >> 16);
-        buffer[offset + 2] = (byte)(value >> 8);
-        buffer[offset + 3] = (byte)value;
+        byte[] msg = new byte[6 + payload.Length];
+        PeerClient.WriteInt(msg, 0, 2 + payload.Length);
+        msg[4] = PeerMessage.Extended;
+        msg[5] = (byte)extId;
+        Buffer.BlockCopy(payload, 0, msg, 6, payload.Length);
+        await stream.WriteAsync(msg, 0, msg.Length, token);
     }
 }

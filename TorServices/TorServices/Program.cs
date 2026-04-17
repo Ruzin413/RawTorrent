@@ -20,24 +20,33 @@ class Program
             return;
         }
 
-        // 3. Route command to correct handler
-        if (command.Action == CommandAction.Download)
+        try
         {
-            var controller = new TorrentController();
-            
-            if (command.TargetFile.StartsWith("magnet:?"))
+            // 3. Route command to correct handler
+            if (command.Action == CommandAction.Download)
             {
-                await controller.StartMagnetDownload(command.TargetFile);
+                var controller = new TorrentController();
+                
+                if (command.TargetFile.StartsWith("magnet:?"))
+                {
+                    await controller.StartMagnetDownload(command.TargetFile, command.OutputDirectory);
+                }
+                else
+                {
+                    await controller.StartDownload(command.TargetFile, command.OutputDirectory);
+                }
             }
             else
             {
-                await controller.StartDownload(command.TargetFile);
+                Console.WriteLine($"Unknown action: {args[0]}");
+                PrintUsage();
             }
         }
-        else
+        catch (Exception ex)
         {
-            Console.WriteLine($"Unknown action: {args[0]}");
-            PrintUsage();
+            Console.WriteLine($"\n❌ CRITICAL ERROR: {ex.Message}");
+            if (ex.InnerException != null) Console.WriteLine($"   Inner: {ex.InnerException.Message}");
+            Console.WriteLine(ex.StackTrace);
         }
     }
 
