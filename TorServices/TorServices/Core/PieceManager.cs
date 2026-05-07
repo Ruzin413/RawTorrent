@@ -15,14 +15,28 @@ public class PieceManager : IDisposable
     private readonly Dictionary<string, FileStream> _fileHandles = new();
     private readonly object _lock = new();
 
-    public PieceManager(TorrentMetadata metadata, string outputDir)
+    public PieceManager(TorrentMetadata metadata, string outputDir, byte[]? initialBitfield = null)
     {
         _metadata = metadata;
         _outputDir = string.IsNullOrWhiteSpace(outputDir) ? @"C:\Users\Dell\Desktop\TorrentDownload" : outputDir;
         
+        if (initialBitfield != null)
+        {
+            for (int i = 0; i < _metadata.Pieces.Length / 20; i++)
+            {
+                int byteIndex = i / 8;
+                int bitIndex = 7 - (i % 8);
+                if (byteIndex < initialBitfield.Length && (initialBitfield[byteIndex] & (1 << bitIndex)) != 0)
+                {
+                    _completed.TryAdd(i, true);
+                }
+            }
+        }
+
         EnsureDirectoriesAndFiles();
         OpenHandles();
     }
+
 
     private void EnsureDirectoriesAndFiles()
     {
@@ -38,20 +52,22 @@ public class PieceManager : IDisposable
 
                 if (!File.Exists(fullPath))
                 {
-                    using var fs = File.Create(fullPath);
+                    using var fs = new FileStream(fullPath, FileMode.Create, FileAccess.Write, FileShare.ReadWrite);
                     fs.SetLength(file.Length);
                 }
+
                 else
                 {
-                    using var fs = new FileStream(fullPath, FileMode.Open, FileAccess.Write);
+                    using var fs = new FileStream(fullPath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite);
                     if (fs.Length < file.Length)
+
                         fs.SetLength(file.Length);
                 }
             }
         }
-        catch (Exception ex)
+        catch
         {
-            Console.WriteLine($"\n[X] File initialization error: {ex.Message}");
+            // Error handled silently
             throw;
         }
     }
@@ -67,9 +83,9 @@ public class PieceManager : IDisposable
                 _fileHandles[file.Path] = fs;
             }
         }
-        catch (Exception ex)
+        catch
         {
-            Console.WriteLine($"\n[X] Failed to open file handles: {ex.Message}");
+            // Error handled silently
             throw;
         }
     }
@@ -121,6 +137,7 @@ public class PieceManager : IDisposable
                     {
                         fs.Seek(writeOffsetInFile, SeekOrigin.Begin);
                         fs.Write(data, readOffsetInData, bytesToWrite);
+                        fs.Flush(); // Ensure data is written to disk
                     }
                 }
             }
@@ -130,10 +147,27 @@ public class PieceManager : IDisposable
 
     public void BuildFile(int totalPieces, string fileName)
     {
-        Console.WriteLine($"\n[*] Download progress: {_completed.Count}/{totalPieces} pieces.");
+        // Progress logged to status property instead
+    }
+
+    public byte[] GetBitfield()
+    {
+        int totalPieces = _metadata.Pieces.Length / 20;
+        byte[] bitfield = new byte[(totalPieces + 7) / 8];
+        foreach (var index in _completed.Keys)
+        {
+            int byteIndex = index / 8;
+            int bitIndex = 7 - (index % 8);
+            if (byteIndex < bitfield.Length)
+            {
+                bitfield[byteIndex] |= (byte)(1 << bitIndex);
+            }
+        }
+        return bitfield;
     }
 
     public void Dispose()
+
     {
         lock (_lock)
         {

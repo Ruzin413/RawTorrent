@@ -40,7 +40,7 @@ public class DhtClient : IDisposable
                 retryCount++;
                 if (retryCount >= 10) 
                 {
-                    Console.WriteLine($"\n[!] Warning: Could not bind to any DHT port in range {port}-{port+9}. DHT discovery will be disabled.");
+                    // Bind failure handled silently
                 }
             }
         }

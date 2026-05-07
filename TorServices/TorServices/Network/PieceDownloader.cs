@@ -91,12 +91,8 @@ public class PieceDownloader
                 Buffer.BlockCopy(payload, 8, data, pBegin, dataLen);
                 receivedBytes += dataLen;
                 pendingRequests--;
-
-                if (receivedBytes % (BlockSize * 4) == 0 || receivedBytes >= length)
-                    Console.Write(".");
             }
         }
-        Console.WriteLine();
         return data;
     }
 

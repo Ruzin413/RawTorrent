@@ -69,6 +69,21 @@ public class TorrentMetadata
         }
         return path;
     }
+
+    public void Rename(string newName)
+    {
+        string oldRoot = CleanupPath(Name);
+        string newRoot = CleanupPath(newName);
+        Name = newName;
+
+        foreach (var file in Files)
+        {
+            if (file.Path.StartsWith(oldRoot))
+            {
+                file.Path = Path.Combine(newRoot, file.Path.Substring(oldRoot.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+            }
+        }
+    }
 }
 
 public static class IntHelper

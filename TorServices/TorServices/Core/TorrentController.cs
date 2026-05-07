@@ -20,17 +20,47 @@ public class TorrentController
     private readonly ConcurrentQueue<string> _peerDiscoveryQueue = new();
     private readonly ConcurrentDictionary<string, bool> _triedPeers = new();
     private readonly List<PeerSession> _activeSessions = new();
+    private PieceManager? _pieceManager;
+    private CancellationTokenSource? _cts;
+    private readonly SemaphoreSlim _downloadSemaphore = new(1, 1);
     private const int MaxActiveSessions = 30;
+    public string Id { get; private set; } = Guid.NewGuid().ToString("N");
+    public void SetId(string id) => Id = id;
+    public string Name { get; set; } = "Initializing...";
+    public string Status { get; set; } = "Queued";
+    public int TotalPieces { get; set; }
+
+    private int _lastCompletedPieces;
+    public int CompletedPieces => _pieceManager?.CompletedCount ?? _lastCompletedPieces;
+
+    public int ActivePeersCount => _activeSessions.Count;
+    public long TotalSize { get; private set; }
+
+    public string? TorrentPath { get; set; }
+    public string? MagnetUri { get; set; }
+    public string? OutputDir { get; set; }
+    public string? ClientId { get; set; }
+    public byte[]? InitialBitfield { get; set; }
+
+
+    public void Stop() => _cts?.Cancel();
+    public byte[]? GetBitfield() => _pieceManager?.GetBitfield();
+
 
     public async Task StartDownload(string torrentPath, string? outputDir = null)
     {
-        Console.WriteLine("==> STARTING TORRENT ENGINE\n");
+        Console.WriteLine($"[+] Starting torrent download from file: {torrentPath}");
+
 
         byte[] torrentData = TorrentFileReader.Read(torrentPath);
         var parser = new BencodeParser(torrentData);
         var meta = parser.Parse() as Dictionary<string, object>;
 
-        if (meta == null) return;
+        if (meta == null) 
+        {
+            Status = "Error: Invalid Torrent";
+            return;
+        }
 
         var infoDict = meta["info"] as Dictionary<string, object>;
         var metadata = new TorrentMetadata(infoDict!);
@@ -44,7 +74,6 @@ public class TorrentController
 
     public async Task StartMagnetDownload(string magnetUri, string? outputDir = null)
     {
-        Console.WriteLine("==> STARTING MAGNET ENGINE\n");
 
         var magnet = MagnetParser.Parse(magnetUri);
         string peerId = "-TS0001-" + Guid.NewGuid().ToString("N")[..12];
@@ -69,7 +98,7 @@ public class TorrentController
 
         // Wait for at least some peers to be discovered
         DateTime start = DateTime.Now;
-        while (_peerDiscoveryQueue.IsEmpty && (DateTime.Now - start).TotalSeconds < 10) await Task.Delay(500);
+        while (_peerDiscoveryQueue.IsEmpty && (DateTime.Now - start).TotalSeconds < 30) await Task.Delay(500);
 
         // 2. Fetch metadata from peers concurrently
         var fetcher = new MetadataFetcher();
@@ -77,8 +106,6 @@ public class TorrentController
         using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(2));
         var fetchTasks = new List<Task>();
         const int MaxMetadataConcurrent = 20;
-
-        Console.WriteLine("[*] Searching metadata from discovered peers concurrently...");
 
         while (infoData == null && !cts.IsCancellationRequested)
         {
@@ -105,7 +132,11 @@ public class TorrentController
             if (infoData != null) break;
         }
 
-        if (infoData == null) { Console.WriteLine("[X] Failed to fetch metadata."); return; }
+        if (infoData == null) 
+        { 
+            Status = "Error: Metadata Fetch Failed";
+            return; 
+        }
 
         var parser = new BencodeParser(infoData);
         var infoDict = parser.Parse() as Dictionary<string, object>;
@@ -116,12 +147,43 @@ public class TorrentController
 
     private async Task ExecuteDownload(byte[] infoHash, string peerId, TorrentMetadata metadata, List<string> trackers, string? outputDir, List<string>? initialPeers = null)
     {
-        _triedPeers.Clear(); // Critical: Reset so we can connect to peers used for metadata
-        int pieceCount = metadata.Pieces.Length / 20;
-        using var pieceManager = new PieceManager(metadata, outputDir!);
-        using var cts = new CancellationTokenSource();
+        await _downloadSemaphore.WaitAsync();
+        try
+        {
+            _pieceManager?.Dispose();
+            _pieceManager = null;
 
-        Console.WriteLine($"\n[+] {metadata.Name} ({pieceCount} pieces)");
+            _triedPeers.Clear(); // Critical: Reset so we can connect to peers used for metadata
+
+        TotalPieces = metadata.Pieces.Length / 20;
+        _lastCompletedPieces = InitialBitfield != null ? CountSetBits(InitialBitfield) : 0;
+        TotalSize = metadata.TotalLength;
+
+        Name = metadata.Name;
+        
+        // Handle name conflicts
+        string finalName = Name;
+        int counter = 1;
+        while (Directory.Exists(Path.Combine(outputDir!, finalName)) || 
+               File.Exists(Path.Combine(outputDir!, finalName)))
+        {
+            finalName = $"{Name} ({counter++})";
+        }
+        
+        if (finalName != Name)
+        {
+            Name = finalName;
+            metadata.Rename(finalName);
+        }
+        
+        Status = "Downloading";
+        Console.WriteLine($"[!] Torrent '{Name}' metadata parsed. Size: {TotalSize / 1024 / 1024} MB, Pieces: {TotalPieces}");
+
+
+        _pieceManager = new PieceManager(metadata, outputDir!, InitialBitfield);
+
+        _cts = new CancellationTokenSource();
+        var cts = _cts;
 
         // 1. Start background discovery
         _ = Task.Run(async () => {
@@ -131,7 +193,6 @@ public class TorrentController
                         var ps = await _tracker.GetPeers(t, infoHash, metadata.TotalLength, peerId);
                         var newPeers = ps.Where(p => !_triedPeers.ContainsKey(p)).ToList();
                         if (newPeers.Count > 0) {
-                            Console.WriteLine($"[i] Tracker {t} found {newPeers.Count} new peers.");
                             foreach (var p in newPeers) _peerDiscoveryQueue.Enqueue(p);
                         }
                     } catch { }
@@ -145,7 +206,6 @@ public class TorrentController
                 var ps = await _dht.GetPeersAsync(infoHash);
                 var newPeers = ps.Where(p => !_triedPeers.ContainsKey(p)).ToList();
                 if (newPeers.Count > 0) {
-                    Console.WriteLine($"[i] DHT found {newPeers.Count} new peers.");
                     foreach (var p in newPeers) _peerDiscoveryQueue.Enqueue(p);
                 }
                 await Task.Delay(TimeSpan.FromMinutes(5), cts.Token);
@@ -162,52 +222,49 @@ public class TorrentController
         for (int i = 0; i < MaxActiveSessions; i++)
         {
             downloadTasks.Add(Task.Run(async () => {
-                while (!cts.IsCancellationRequested && pieceManager.CompletedCount < pieceCount)
+                while (!cts.IsCancellationRequested && _pieceManager.CompletedCount < TotalPieces)
                 {
                     if (_peerDiscoveryQueue.TryDequeue(out string? peerAddr))
                     {
                         if (!_triedPeers.TryAdd(peerAddr, true)) continue;
 
                         try {
-                            using var session = new PeerSession(peerAddr, infoHash, peerId, pieceCount);
+                            using var session = new PeerSession(peerAddr, infoHash, peerId, TotalPieces);
                             session.OnPeersDiscovered += (parent, found) => {
                                 foreach (var f in found) _peerDiscoveryQueue.Enqueue(f);
                             };
 
                             if (await session.StartAsync(cts.Token))
                             {
-                                Console.WriteLine($"[+] Connected to {peerAddr}");
                                 lock (_activeSessions) _activeSessions.Add(session);
                                 
                                 try {
-                                    while (session.Connected && pieceManager.CompletedCount < pieceCount)
+                                    while (session.Connected && _pieceManager.CompletedCount < TotalPieces)
                                     {
-                                        int pieceIndex = PickPieceRarestFirst(session, pieceManager, pieceCount, out bool isEndgame);
+                                        int pieceIndex = PickPieceRarestFirst(session, _pieceManager, TotalPieces, out bool isEndgame);
                                         if (pieceIndex == -1) { await Task.Delay(1000); continue; }
 
-                                        if (pieceManager.TryClaimPiece(pieceIndex) || isEndgame)
+                                        if (_pieceManager.TryClaimPiece(pieceIndex) || isEndgame)
                                         {
                                             try {
-                                                var data = await session.RequestPieceAsync(pieceIndex, GetPieceLength(pieceIndex, pieceCount, metadata.TotalLength, metadata.PieceLength), cts.Token);
+                                                var data = await session.RequestPieceAsync(pieceIndex, GetPieceLength(pieceIndex, TotalPieces, metadata.TotalLength, metadata.PieceLength), cts.Token);
                                                 
                                                 byte[] expectedHash = new byte[20];
                                                 Buffer.BlockCopy(metadata.Pieces, pieceIndex * 20, expectedHash, 0, 20);
 
                                                 if (PieceVerifier.Verify(data, expectedHash)) {
-                                                    pieceManager.Store(pieceIndex, data);
-                                                    Console.Write(".");
+                                                    _pieceManager.Store(pieceIndex, data);
                                                 } else {
-                                                    pieceManager.ReleasePiece(pieceIndex);
+                                                    _pieceManager.ReleasePiece(pieceIndex);
                                                 }
                                             } catch {
-                                                pieceManager.ReleasePiece(pieceIndex);
+                                                _pieceManager.ReleasePiece(pieceIndex);
                                                 throw; // Drop connection if download fails
                                             }
                                         }
                                     }
                                 } finally {
                                     lock (_activeSessions) _activeSessions.Remove(session);
-                                    Console.WriteLine($"[-] Disconnected from {peerAddr}");
                                 }
                             }
                         } catch { }
@@ -221,20 +278,38 @@ public class TorrentController
             }));
         }
 
-        while (pieceManager.CompletedCount < pieceCount) {
-            string status = $"[>] Progress: {pieceManager.CompletedCount}/{pieceCount} ({((double)pieceManager.CompletedCount/pieceCount*100):0.0}%) | Active Peers: {_activeSessions.Count}     ";
-            Console.Title = status;
-            
-            // Also print to console directly for visibility
-            Console.Write($"\r{status}");
-            
+        while (_pieceManager.CompletedCount < TotalPieces && !cts.IsCancellationRequested) {
             await Task.Delay(1000);
         }
 
+        if (_pieceManager.CompletedCount >= TotalPieces)
+        {
+            Status = "Completed";
+            Console.WriteLine($"[v] Torrent '{Name}' download completed successfully!");
+        }
+        else
+        {
+            Status = "Stopped";
+            Console.WriteLine($"[x] Torrent '{Name}' download stopped/cancelled.");
+        }
+
+
         cts.Cancel();
         await Task.WhenAll(downloadTasks);
-        Console.WriteLine("\n*** DOWNLOAD COMPLETE ***");
+        
+        _lastCompletedPieces = _pieceManager?.CompletedCount ?? _lastCompletedPieces;
+        InitialBitfield = _pieceManager?.GetBitfield() ?? InitialBitfield;
+
+        _pieceManager?.Dispose();
+
+        _pieceManager = null;
     }
+    finally
+    {
+        _downloadSemaphore.Release();
+    }
+}
+
 
     private int PickPieceRarestFirst(PeerSession session, PieceManager pieceManager, int totalPieces, out bool isEndgame)
     {
@@ -314,5 +389,19 @@ public class TorrentController
         if (meta.ContainsKey("announce-list") && meta["announce-list"] is List<object> list)
             foreach (var tier in list) if (tier is List<object> tl) foreach (var t in tl) trackers.Add(Encoding.UTF8.GetString((t as byte[])!));
         return trackers.Distinct().ToList();
+    }
+
+    private int CountSetBits(byte[] bitfield)
+    {
+        int count = 0;
+        foreach (byte b in bitfield)
+        {
+            int v = b;
+            for (int i = 0; i < 8; i++)
+            {
+                if ((v & (1 << i)) != 0) count++;
+            }
+        }
+        return count;
     }
 }
